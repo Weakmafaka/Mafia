@@ -1,425 +1,369 @@
-from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+import io
+import os
+from typing import Optional
+
+from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
+from PIL import Image, ImageDraw, ImageFont
+from sqlalchemy import select, update
 
-from utils.library import bot
-from aiogram.exceptions import TelegramBadRequest
-import logging
+from database.controllers.ui_state import set_menu_message_id
+from database.database import db
+from database.models.user import User
+from core.telegram import bot
 
 router = Router()
 
 
-@router.message(Command("start"))
-async def command_start(msg: Message, state: FSMContext):
-    # Обработка deep-link для подарка
-    if msg.text and msg.text.startswith("/start gift_"):
-        from Database.database import db
-        parts = msg.text.split()
-        payload = parts[1] if len(parts) > 1 else msg.text[len("/start "):]
-        gift_code = payload[len("gift_"):] if payload.startswith("gift_") else None
-        if not gift_code:
-            await msg.answer("❗️Некорректная ссылка подарка.")
-            logging.warning(f"Некорректная ссылка подарка: {msg.text}")
-            return
-        success = db.redeem_gift_subscription(gift_code, msg.from_user.id)
-        logging.info(f"redeem_gift_subscription({gift_code}, {msg.from_user.id}) => {success}")
-        if not success:
-            await msg.answer("❗️Ссылка недействительна или уже использована.")
-            logging.warning(f"Подарок не активирован: {gift_code} для {msg.from_user.id}")
-            return
-        db.set_premium_status(msg.from_user.id, True, 30)
-        logging.info(f"set_premium_status({msg.from_user.id}, True, 30)")
-        await msg.answer("🎉 Вам подарили подписку на 30 дней! Пользуйтесь на здоровье! 🥰")
-        # Показываем главное меню
-        age_group = db.get_user_age(msg.from_user.id) or "0-3"
-        try:
-            await show_main_menu(msg.from_user.id, age_group, state)
-        except Exception as e:
-            logging.warning(f"Ошибка при открытии главного меню после подарка: {e}")
-        return
+class SettingsState(StatesGroup):
+    waiting_nickname = State()
 
+
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Настройки", callback_data="menu_settings"),
+                InlineKeyboardButton(text="Начать игру", callback_data="menu_start_game"),
+            ],
+            [
+                InlineKeyboardButton(text="Рейтинг", callback_data="menu_rating"),
+                InlineKeyboardButton(text="Правила", callback_data="menu_rules"),
+            ],
+        ]
+    )
+
+
+def settings_keyboard(notifications_enabled: bool) -> InlineKeyboardMarkup:
+    notif_text = "Рассылка: Вкл" if notifications_enabled else "Рассылка: Выкл"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=notif_text, callback_data="settings_toggle_notifications")],
+            [InlineKeyboardButton(text="Сменить никнейм", callback_data="settings_change_nickname")],
+            [InlineKeyboardButton(text="Назад", callback_data="back_main")],
+        ]
+    )
+
+
+def nickname_input_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Назад", callback_data="back_main")],
+        ]
+    )
+
+
+def role_stats_line(user: User) -> str:
+    games = max(user.games_played, 1)
+    mafia_pct = round((user.mafia_wins / games) * 100, 1)
+    civilian_pct = round((user.civilian_wins / games) * 100, 1)
+    if mafia_pct >= civilian_pct:
+        return "Лучше за мафию: {}% побед".format(mafia_pct)
+    return "Лучше за мирных: {}% побед".format(civilian_pct)
+
+
+def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
+    font_candidates = [
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Helvetica.ttc",
+        "/Library/Fonts/Arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for path in font_candidates:
+        if path and os.path.exists(path):
+            return ImageFont.truetype(path, size=size)
+    return ImageFont.load_default()
+
+
+def build_profile_image(user: User, nickname: str) -> BufferedInputFile:
+    games = user.games_played
+    wins = user.wins
+    losses = user.losses
+    total_for_rate = max(games, 1)
+    win_rate = round((wins / total_for_rate) * 100, 1)
+    lose_rate = round((losses / total_for_rate) * 100, 1)
+
+    image = Image.new("RGB", (1200, 628), color="white")
+    draw = ImageDraw.Draw(image)
+    title_font = load_font(62, bold=True)
+    text_font = load_font(42)
+    small_font = load_font(36)
+    lines = [
+        "MAFIA BOT PROFILE",
+        "",
+        "Никнейм: {}".format(nickname),
+        "Игр сыграно: {}".format(games),
+        "Рейтинг: {}".format(user.rating),
+        "Победы: {}% | Поражения: {}%".format(win_rate, lose_rate),
+        role_stats_line(user),
+    ]
+    y = 50
+    for index, line in enumerate(lines):
+        fill = "black" if index else "#222222"
+        if index == 0:
+            draw.text((70, y), line, fill=fill, font=title_font)
+            y += 86
+            continue
+        if index == 1:
+            y += 12
+            continue
+        font = small_font if index == len(lines) - 1 else text_font
+        draw.text((70, y), line, fill=fill, font=font)
+        y += 70
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return BufferedInputFile(buffer.getvalue(), filename="profile_card.png")
+
+
+async def get_user(tg_user_id: int) -> Optional[User]:
+    async with db() as session:
+        return await session.scalar(select(User).where(User.tg_user_id == tg_user_id))
+
+
+async def ensure_user_exists(message: Message) -> User:
+    telegram_user = message.from_user
+    assert telegram_user is not None
+
+    async with db() as session:
+        user = await session.scalar(select(User).where(User.tg_user_id == telegram_user.id))
+        if user is None:
+            nickname = telegram_user.username or telegram_user.first_name or "Игрок"
+            user = User(
+                tg_user_id=telegram_user.id,
+                username=telegram_user.username,
+                first_name=telegram_user.first_name,
+                nickname=nickname,
+            )
+            session.add(user)
+        else:
+            user.username = telegram_user.username
+            user.first_name = telegram_user.first_name
+            if not user.nickname:
+                user.nickname = telegram_user.username or telegram_user.first_name or "Игрок"
+        await session.commit()
+        await session.refresh(user)
+        return user
+
+
+async def render_main_menu(chat_id: int, user: User, state: FSMContext) -> None:
+    nickname = user.nickname or user.username or user.first_name or "Игрок"
+    caption = (
+        "Привет, {}!\n\n"
+        "Добро пожаловать в Mafia Bot.\n"
+        "Выбери действие в меню ниже."
+    ).format(nickname)
+    keyboard = main_menu_keyboard()
+    photo = build_profile_image(user, nickname)
     data = await state.get_data()
-    message_to_delete = data.get('message_to_delete')
+    message_id = data.get("menu_message_id")
 
-    # Добавляем пользователя в базу данных, если он новый
-    from main import db  # Импортируем db из main
-    db.add_user(
-        user_id=msg.from_user.id,
-        username=msg.from_user.username,
-        first_name=msg.from_user.first_name,
+    if message_id:
+        try:
+            await bot.edit_message_media(
+                chat_id=chat_id,
+                message_id=message_id,
+                media=InputMediaPhoto(media=photo, caption=caption),
+                reply_markup=keyboard,
+            )
+            await set_menu_message_id(user.tg_user_id, message_id)
+            return
+        except TelegramBadRequest:
+            pass
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except TelegramBadRequest:
+            pass
+
+    sent = await bot.send_photo(chat_id=chat_id, photo=photo, caption=caption, reply_markup=keyboard)
+    await state.update_data(menu_message_id=sent.message_id)
+    await set_menu_message_id(user.tg_user_id, sent.message_id)
+
+
+async def edit_menu_caption(chat_id: int, message_id: int, text: str, keyboard: InlineKeyboardMarkup) -> None:
+    try:
+        await bot.edit_message_caption(
+            chat_id=chat_id,
+            message_id=message_id,
+            caption=text,
+            reply_markup=keyboard,
+        )
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
+
+
+def rules_text() -> str:
+    return (
+        "Правила Мафии\n\n"
+        "1. Есть две стороны: мафия и мирные.\n"
+        "2. Ночью мафия делает ход, днем игроки обсуждают и голосуют.\n"
+        "3. Мирные побеждают, когда выбили всю мафию.\n"
+        "4. Мафия побеждает, когда сравнялась по числу с мирными.\n\n"
+        "Собирай команду и начинай игру."
     )
 
-    # Обновляем время последней активности
-    db.update_user_activity(msg.from_user.id)
 
-    # Проверяем, является ли пользователь администратором
-    is_admin = db.is_admin(msg.from_user.id)
+@router.message(Command("start"), F.chat.type == "private")
+async def command_start(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    menu_message_id = data.get("menu_message_id")
+    await state.clear()
+    if menu_message_id:
+        await state.update_data(menu_message_id=menu_message_id)
+    user = await ensure_user_exists(message)
+    await render_main_menu(chat_id=message.chat.id, user=user, state=state)
 
-    # Проверяем, выбирал ли пользователь возраст ранее
-    age_group = db.get_user_age(msg.from_user.id)
 
-    if age_group:
-        # Если возраст уже выбран, сразу переходим к главному меню
-        await show_main_menu(msg.from_user.id, age_group, state, message_to_edit_id=message_to_delete)
+@router.callback_query(F.data == "menu_settings")
+async def callback_settings(query: CallbackQuery, state: FSMContext) -> None:
+    user = await get_user(query.from_user.id)
+    if user is None:
+        return
+    await query.answer()
+    await edit_menu_caption(
+        chat_id=query.message.chat.id,
+        message_id=query.message.message_id,
+        text=(
+            "Настройки\n\n"
+            "Здесь можно включить/выключить рассылку и сменить никнейм."
+        ),
+        keyboard=settings_keyboard(user.notifications_enabled),
+    )
+    await state.update_data(menu_message_id=query.message.message_id)
+
+
+@router.callback_query(F.data == "settings_toggle_notifications")
+async def callback_toggle_notifications(query: CallbackQuery) -> None:
+    user = await get_user(query.from_user.id)
+    if user is None:
         return
 
-    # Приветственное сообщение с анимацией
-    welcome_message = (
-        f"Привет, {msg.from_user.first_name}! 👋\n\n"
-        f"Меня зовут Янтарик, и я твой волшебный помощник! 🧙‍♂️\n\n"
-        f"Здесь ты найдешь множество интересного контента:\n"
-        f"• Сказки 🧙‍♀\n"
-        f"• Мультики 🧜\n"
-        f"• Музыка 🎤\n"
-        f"• Игры 🎮\n"
-        f"• Полезные материалы 🔓\n\n"
-        f"AI-Помощник 🧠– Умный помощник, который подскажет:"
-        f"   • чем заняться с ребёнком.\n"
-        f"   • как развивать малыша.\n"
-        f"   • какие игрушки или книги подходят сейчас.\n"
-        f"Афиша детских событий 🎟– Будьте в курсе лучших мероприятий: спектакли, мастер-классы, семейные праздники, выставки. Всё — рядом с вами и по возрасту ребёнка."
-        f"Чтобы начать, выбери возрастную группу твоего ребенка:"
-    )
-    # welcome_message = (
-    #     f"Привет, {query.from_user.first_name}! 👋\n\n"
-    #     f"Меня зовут Янтарик, и я твой волшебный помощник! 🧙‍♂️\n\n"
-    #     f"Здесь ты найдешь множество интересного контента:\n"
-    #     f"🎮 Развивающие игры – Играем, развиваем логику, учим цвета, формы, счёт и не только!\n"
-    #     f"📖 Сказки и мультики – Авторские и классические сказки, добрые мультфильмы.\n"
-    #     f"🎵 Музыка и аудиокниги – Успокаивающие мелодии, обучающие песенки, музыка для игр и сна.\n"
-    #     f"🔓 Полезные материалы – Рекомендации по уходу за ребенком, питание, развитие и многое другое!\n"
-    #     f"🧠 AI-Помощник – Умный помощник, который подскажет:"
-    #     f"   • чем заняться с ребёнком.\n"
-    #     f"   • как развивать малыша.\n"
-    #     f"   • какие игрушки или книги подходят сейчас.\n"
-    #     f"Родители всегда знают, что делать — без бесконечных поисков в интернете.\n\n"
-    #     f"🎟️ Афиша детских событий – Будьте в курсе лучших мероприятий: спектакли, мастер-классы, семейные праздники, выставки. Всё — рядом с вами и по возрасту ребёнка."
-    #     f"Чтобы начать, выбери возрастную группу твоего ребенка:"
-    # )
-    # Создаем инлайн-кнопки для выбора возраста
-    age_buttons = [
-        [
-            InlineKeyboardButton(text="0-3 года 👶", callback_data="select_age_0-3"),
-            InlineKeyboardButton(text="4-6 лет 🧒", callback_data="select_age_4-6")
-        ],
-        [InlineKeyboardButton(text="7-10 лет 👦", callback_data="select_age_7-10")],
-        [
-            InlineKeyboardButton(text="Афиша 🎪",
-                                 web_app=WebAppInfo(url="https://incredible-kelpie-fd6770.netlify.app")),
-            InlineKeyboardButton(text="Поддержка 🛟", callback_data="support")
-        ]
-    ]
-
-    # Добавляем кнопку администратора, если пользователь - админ
-    if is_admin:
-        admin_button = [InlineKeyboardButton(text="Администратор 👑", callback_data="admin_panel")]
-        age_buttons.append(admin_button)
-
-    age_keyboard = InlineKeyboardMarkup(inline_keyboard=age_buttons)
-
-    if message_to_delete:
-        try:
-            await bot.delete_message(chat_id=msg.from_user.id, message_id=message_to_delete)
-        except Exception as e:
-            logging.warning(f"Не удалось удалить старое сообщение: {e}")
-
-    # Всегда отправляем анимацию с приветственным сообщением
-    try:
-        message_to_edit = await msg.answer_animation(
-            animation="CgACAgIAAxkBAAIHvWglxQjHsgVaTluGy3c7V5kiLk_qAANtAAK2aShJiTkQ17X4v8Y2BA",
-            caption=welcome_message,
-            reply_markup=age_keyboard
+    new_value = not user.notifications_enabled
+    async with db() as session:
+        await session.execute(
+            update(User).where(User.tg_user_id == query.from_user.id).values(notifications_enabled=new_value)
         )
-    except Exception as e:
-        logging.error(f"Ошибка при отправке анимации: {e}")
-        # В крайнем случае отправим обычное сообщение
-        message_to_edit = await msg.answer(
-            text=welcome_message,
-            reply_markup=age_keyboard
-        )
+        await session.commit()
 
-    # Сохраняем ID отправленного сообщения
-    if message_to_edit:
-        await state.update_data(message_to_delete=message_to_edit.message_id)
-    else:
-        await state.update_data(message_to_delete=None)
-
-
-@router.callback_query(F.data.startswith('select_age_'))
-async def handle_age_selection(query: CallbackQuery, state: FSMContext):
-    """Обработка выбора возраста через инлайн-кнопки"""
-    age_group = query.data.split('_')[2]  # select_age_0-3 -> 0-3
-    
-    # Сохраняем выбранный возраст в базе данных
-    from main import db
-    db.set_user_age(query.from_user.id, age_group)
-    
-    # Обновляем время последней активности
-    db.update_user_activity(query.from_user.id)
-    db.increment_age_selection(age_group)
-
-    # Отображаем главное меню, редактируя текущее сообщение
-    await show_main_menu(query.from_user.id,
-                         age_group,
-                         state,
-                         message_to_edit_id=query.message.message_id)
-
-
-async def show_main_menu(user_id: int, age_group: str, state: FSMContext, message_to_edit_id: int = None):
-    """Показывает главное меню бота в зависимости от выбранного возраста"""
-    from main import db
-    # Формируем основное меню в зависимости от возраста
-    is_premium = db.check_premium_status(user_id)
-    if age_group in ["0-3"]:
-        menu_buttons = [
-            [
-                InlineKeyboardButton(text="Мультики 🧜", callback_data="menu_cartoons"),
-                InlineKeyboardButton(text="Музыка 🎶", callback_data="menu_music")
-            ],
-            [
-                InlineKeyboardButton(text="Сказки 🧙‍♀", callback_data="menu_fairy_tales"),
-                InlineKeyboardButton(text="Полезное 🔓", callback_data="menu_useful")
-             ],
-            [
-                InlineKeyboardButton(text="AI Помощник 🤖",
-                                     callback_data="ai_assistant" if is_premium else "require_subscription")
-            ],
-            [
-                InlineKeyboardButton(text="Премиум подписка 🌟", callback_data="menu_subscription")
-            ],
-            [
-                InlineKeyboardButton(text="Поддержка 🛟", callback_data="support"),
-                InlineKeyboardButton(text="Сменить возраст 🔄", callback_data="change_age")
-            ]
-        ]
-
-    elif age_group in ["4-6"]:
-        menu_buttons = [
-            [
-                InlineKeyboardButton(text="Мультики 🧜", callback_data="menu_cartoons"),
-                InlineKeyboardButton(text="Музыка 🎶", callback_data="menu_music")
-            ],
-            [
-                InlineKeyboardButton(text="Сказки 🧙‍♀", callback_data="menu_fairy_tales"),
-                InlineKeyboardButton(text="Игры 🎮", callback_data="menu_games")
-            ],
-            [
-                InlineKeyboardButton(text="Полезное 🔓", callback_data="menu_useful")
-            ],
-            [
-                InlineKeyboardButton(text="AI Помощник 🤖",
-                                     callback_data="ai_assistant" if is_premium else "require_subscription")
-            ],
-            [
-                InlineKeyboardButton(text="Премиум подписка 🌟", callback_data="menu_subscription")
-            ],
-            [
-                InlineKeyboardButton(text="Поддержка 🛟", callback_data="support"),
-                InlineKeyboardButton(text="Сменить возраст 🔄", callback_data="change_age")
-            ]
-        ]
-    else:  # 7-10
-        menu_buttons = [
-            [
-                InlineKeyboardButton(text="Мультики 🧜", callback_data="menu_cartoons"),
-                InlineKeyboardButton(text="Игры 🎮", callback_data="menu_games")
-            ],
-            [
-                InlineKeyboardButton(text="Английский 🇬🇧", callback_data="menu_english"),
-                InlineKeyboardButton(text="Аудиокниги 🎧", callback_data="menu_books")
-            ],
-
-            [
-                    InlineKeyboardButton(text="Полезное 🔓", callback_data="menu_useful")
-            ],
-            [
-                InlineKeyboardButton(text="AI Помощник 🤖",
-                                     callback_data="ai_assistant" if is_premium else "require_subscription")
-            ],
-            [
-                InlineKeyboardButton(text="Премиум подписка 🌟", callback_data="menu_subscription")
-            ],
-            [
-                InlineKeyboardButton(text="Поддержка 🛟", callback_data="support"),
-                InlineKeyboardButton(text="Сменить возраст 🔄", callback_data="change_age")
-            ]
-        ]
-
-    menu_keyboard = InlineKeyboardMarkup(inline_keyboard=menu_buttons)
-
-    # Определяем текст приветствия в зависимости от возраста
-    age_display = {
-        "0-3": "0-3 года",
-        "4-6": "4-6 лет",
-        "7-10": "7-10 лет"
-    }.get(age_group, age_group)
-
-    message_text = (
-        f"Добро пожаловать в главное меню! 🎯\n\n"
-        f"Выбранный возраст: {age_display}\n\n"
-        f"Выберите категорию, которая вас интересует:"
+    await query.answer("Настройка обновлена")
+    await edit_menu_caption(
+        chat_id=query.message.chat.id,
+        message_id=query.message.message_id,
+        text="Настройки\n\nЗдесь можно включить/выключить рассылку и сменить никнейм.",
+        keyboard=settings_keyboard(new_value),
     )
 
-    edited_message = None
-    if message_to_edit_id:
-        try:
-            # Пытаемся отредактировать переданное сообщение
-            edited_message = await bot.edit_message_text(
-                chat_id=user_id,
-                message_id=message_to_edit_id,
-                text=message_text,
-                reply_markup=menu_keyboard
-            )
-        except TelegramBadRequest as e:
-            logging.warning(f"Не удалось отредактировать сообщение {message_to_edit_id}: {e}")
-            # Если не удалось отредактировать, удаляем старое и отправляем новое
-            try:
-                await bot.delete_message(chat_id=user_id, message_id=message_to_edit_id)
-            except Exception as del_err:
-                 logging.warning(f"Не удалось удалить сообщение {message_to_edit_id}: {del_err}")
-            edited_message = await bot.send_message(
-                chat_id=user_id,
-                text=message_text,
-                reply_markup=menu_keyboard
-            )
-        except Exception as e:
-            logging.error(f"Непредвиденная ошибка при редактировании сообщения {message_to_edit_id}: {e}")
-            # Отправляем новое в случае другой ошибки
-            edited_message = await bot.send_message(
-                chat_id=user_id,
-                text=message_text,
-                reply_markup=menu_keyboard
-            )
-    else:
-        # Если ID для редактирования не передан, отправляем новое сообщение
-        edited_message = await bot.send_message(
-            chat_id=user_id,
-            text=message_text,
-            reply_markup=menu_keyboard
-        )
 
-    # Сохраняем ID актуального сообщения для возможности редактирования в будущем
-    if edited_message:
-        await state.update_data(message_to_delete=edited_message.message_id)
-    else: # На случай если отправка/редактирование не удалось
-        await state.update_data(message_to_delete=None)
-
-
-@router.callback_query(F.data == 'change_age')
-async def change_age(query: CallbackQuery, state: FSMContext):
-    from main import db
-    is_admin = db.is_admin(query.from_user.id)
-
-    age_buttons = [
-        [
-            InlineKeyboardButton(text="0-3 года 👶", callback_data="select_age_0-3"),
-            InlineKeyboardButton(text="4-6 лет 🧒", callback_data="select_age_4-6")
-        ],
-        [InlineKeyboardButton(text="7-10 лет 👦", callback_data="select_age_7-10")],
-        [
-            InlineKeyboardButton(text="Афиша 🎪", web_app=WebAppInfo(url="https://incredible-kelpie-fd6770.netlify.app")),
-            InlineKeyboardButton(text="Поддержка 🛟", callback_data="support")
-        ]
-    ]
-
-    if is_admin:
-        admin_button = [InlineKeyboardButton(text="Администратор 👑", callback_data="admin_panel")]
-        age_buttons.append(admin_button)
-
-    age_keyboard = InlineKeyboardMarkup(inline_keyboard=age_buttons)
-
-    welcome_message = (
-        f"Привет, {query.from_user.first_name}! 👋\n\n"
-        f"Меня зовут Янтарик, и я твой волшебный помощник! 🧙‍♂️\n\n"
-        f"Здесь ты найдешь множество интересного контента:\n"
-        f"• Сказки 🧙‍♀\n"
-        f"• Мультики 🧜\n"
-        f"• Музыка 🎤\n"
-        f"• Игры 🎮\n"
-        f"• Полезные материалы 🔓\n"
-        f"• AI-Помощник 🤖\n\n"
-        f"Афиша 🎪– Будьте в курсе лучших мероприятий: спектакли, мастер-классы, семейные праздники, выставки.\n\n"
-        f"Чтобы начать, выбери возрастную группу твоего ребенка:"
+@router.callback_query(F.data == "settings_change_nickname")
+async def callback_change_nickname(query: CallbackQuery, state: FSMContext) -> None:
+    await query.answer()
+    await state.set_state(SettingsState.waiting_nickname)
+    await state.update_data(menu_message_id=query.message.message_id)
+    await edit_menu_caption(
+        chat_id=query.message.chat.id,
+        message_id=query.message.message_id,
+        text=(
+            "Смена никнейма\n\n"
+            "Отправь новый никнейм одним сообщением.\n"
+            "Длина: 2-32 символа."
+        ),
+        keyboard=nickname_input_keyboard(),
     )
 
-    try:
-        # Удаляем старое сообщение
-        await bot.delete_message(chat_id=query.message.chat.id, message_id=query.message.message_id)
-    except Exception as e:
-        logging.warning(f"Не удалось удалить сообщение: {e}")
 
+@router.message(SettingsState.waiting_nickname)
+async def handle_nickname_input(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    menu_message_id = data.get("menu_message_id")
+    new_nickname = (message.text or "").strip()
     try:
-        # Отправляем анимацию с сообщением
-        new_message = await bot.send_animation(
-            chat_id=query.from_user.id,
-            animation="CgACAgIAAxkBAAIHvWglxQjHsgVaTluGy3c7V5kiLk_qAANtAAK2aShJiTkQ17X4v8Y2BA",
-            caption=welcome_message,
-            reply_markup=age_keyboard
+        await message.delete()
+    except TelegramBadRequest:
+        pass
+
+    if len(new_nickname) < 2 or len(new_nickname) > 32:
+        if menu_message_id:
+            await edit_menu_caption(
+                chat_id=message.chat.id,
+                message_id=menu_message_id,
+                text=(
+                    "Смена никнейма\n\n"
+                    "Никнейм должен быть от 2 до 32 символов.\n"
+                    "Отправь новый никнейм."
+                ),
+                keyboard=nickname_input_keyboard(),
+            )
+        return
+
+    async with db() as session:
+        await session.execute(
+            update(User).where(User.tg_user_id == message.from_user.id).values(nickname=new_nickname)
         )
-        await state.update_data(message_to_delete=new_message.message_id)
-    except Exception as e:
-        logging.error(f"Не удалось отправить анимацию при смене возраста: {e}")
+        await session.commit()
+
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        pass
+
+    await state.clear()
+    if menu_message_id:
+        await state.update_data(menu_message_id=menu_message_id)
+    user = await get_user(message.from_user.id)
+    if user is None:
+        return
+
+    await render_main_menu(chat_id=message.chat.id, user=user, state=state)
 
 
-@router.callback_query(F.data.startswith('menu_'))
-async def handle_menu_selection(query: CallbackQuery, state: FSMContext):
-    """Обработка выбора раздела в главном меню"""
-    menu_type = query.data.split('_')[1]  # menu_cartoons -> cartoons
-    message_id_to_edit = query.message.message_id # Сообщение, которое будем редактировать
-    user_id = query.from_user.id
-    
-    # Получаем возраст пользователя из БД
-    from main import db
-    age_group = db.get_user_age(query.from_user.id)
-    if not age_group:
-         # Если возраст не найден в БД, отправляем на старт
-         await command_start(query.message, state) # Используем message вместо query, т.к. command_start ожидает Message
-         await query.answer() # Отвечаем на callback query
-         return
-         
-    # Обновляем время последней активности
-    db.update_user_activity(query.from_user.id)
-    
-    # Обновляем состояние, сохраняя возраст
-    await state.update_data(type_age=age_group)
-    
-    # Передаем управление соответствующему хендлеру категории
-    # Эти хендлеры теперь должны принимать message_id для редактирования
-    if menu_type == "cartoons":
-        from handlers.categories.cartoons import handle_cartoons
-        await handle_cartoons(user_id, state, age_group, message_id_to_edit)
-    
-    elif menu_type == "music":
-        from handlers.categories.music import send_music
-        await send_music(user_id, state, age_group, message_id_to_edit)
+@router.callback_query(F.data == "menu_rules")
+async def callback_rules(query: CallbackQuery, state: FSMContext) -> None:
+    await query.answer()
+    await edit_menu_caption(
+        chat_id=query.message.chat.id,
+        message_id=query.message.message_id,
+        text=rules_text(),
+        keyboard=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="back_main")]]
+        ),
+    )
+    await state.update_data(menu_message_id=query.message.message_id)
 
-    elif menu_type == "books":
-        from handlers.categories.audio_book import send_book
-        await send_book(user_id, state, age_group, message_id_to_edit)
-    
-    elif menu_type == "fairy":
-        from handlers.categories.fairy_tales import send_fairy
-        await send_fairy(user_id, state, age_group, message_id_to_edit)
-    
-    elif menu_type == "useful":
-        from handlers.categories.useful import other_category
-        await other_category(user_id, state, age_group, message_id_to_edit)
-    
-    elif menu_type == "games":
-        from handlers.categories.games import games
-        await games(user_id, state, age_group, message_id_to_edit)
 
-    elif menu_type == "english":
-        from handlers.categories.english import english
-        await english(user_id, state, age_group, message_id_to_edit)
+@router.callback_query(F.data == "menu_rating")
+async def callback_rating(query: CallbackQuery, state: FSMContext) -> None:
+    user = await get_user(query.from_user.id)
+    if user is None:
+        return
+    await query.answer()
+    win_rate = round((user.wins / max(user.games_played, 1)) * 100, 1)
+    await edit_menu_caption(
+        chat_id=query.message.chat.id,
+        message_id=query.message.message_id,
+        text=(
+            "Рейтинг игрока\n\n"
+            "Рейтинг: {}\n"
+            "Игр сыграно: {}\n"
+            "Победы: {} ({}%)"
+        ).format(user.rating, user.games_played, user.wins, win_rate),
+        keyboard=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="back_main")]]
+        ),
+    )
+    await state.update_data(menu_message_id=query.message.message_id)
 
-    elif menu_type == "subscription":
-        from handlers.subscription.subscription_menu import subscription_menu
-        await subscription_menu(user_id, state, age_group, message_id_to_edit)
 
-    else:
-        # На случай неизвестного callback_data
-        # Отвечаем на callback query перед тем, как показать сообщение
-        await query.answer() 
-        await query.message.answer("Неизвестная команда") # Отправляем сообщение вместо alert
+@router.callback_query(F.data == "back_main")
+async def callback_back_main(query: CallbackQuery, state: FSMContext) -> None:
+    await query.answer()
+    await state.clear()
+    user = await get_user(query.from_user.id)
+    if user is None:
+        return
+    await state.update_data(menu_message_id=query.message.message_id)
+    await render_main_menu(chat_id=query.message.chat.id, user=user, state=state)

@@ -1,12 +1,14 @@
-from utils.library import *
 import logging
 import asyncio
 import os
-from Database.database import db
 from dotenv import load_dotenv
 from handlers.routers import setup_routers
 import sys
 from aiogram.types import BotCommand
+from core.telegram import bot, dp
+from database.controllers.role_catalog import sync_classic_roles
+from database.database import init_db
+from game.classic_mafia import validate_classic_role_distribution
 
 
 load_dotenv()
@@ -29,6 +31,10 @@ logging.basicConfig(level=logging.DEBUG, handlers=[file_handler, console_handler
 
 
 async def main():
+    validate_classic_role_distribution()
+    await init_db()
+    await sync_classic_roles()
+
     await bot.set_my_commands([
         BotCommand(command="start", description="Запуск бота"),
     ])
